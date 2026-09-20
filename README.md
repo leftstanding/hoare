@@ -1,5 +1,9 @@
 # Hoare
 
+[![CI](https://github.com/leftstanding/hoare/actions/workflows/ci.yml/badge.svg)](https://github.com/leftstanding/hoare/actions/workflows/ci.yml)
+[![Hex Version](https://img.shields.io/hexpm/v/hoare.svg)](https://hex.pm/packages/hoare)
+[![License](https://img.shields.io/hexpm/l/hoare.svg)](https://github.com/leftstanding/hoare/blob/master/LICENSE)
+
 Declared state transitions as pre/post contracts.
 
 A transition names the states it leaves and the state it reaches, the guards
@@ -11,6 +15,16 @@ law: a run ends in `to` or leaves the record in `from`, never between.
 check   from ▸ guards            pure, on the resolved record
 perform effects                  IO; bare = idempotent, {run, undo} = reverted on failure
 commit  lock ▸ re-read ▸ body ▸ write to ▸ assert to     one transaction
+```
+
+## Installation
+
+```elixir
+def deps do
+  [
+    {:hoare, "~> 0.1"}
+  ]
+end
 ```
 
 ## States
