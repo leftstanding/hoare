@@ -11,12 +11,26 @@ defmodule Hoare.Transition do
   `ctx -> {:ok, ctx} | {:error, reason}` and may refine the context it returns.
   The domain declares the transition; the module owning the records supplies
   the body of the commit when it runs it, and `commit/5` wraps that body in the
-  store's locked transaction, the `from` re-check and the `to` write.
+  store's locked transaction, the re-check and the `to` write.
+
+  The commit re-reads the record under the lock and runs `check/2` again on
+  it, so a guard runs twice and must be a function of the context alone.
+  A guard writes only keys no effect writes, since its second run overwrites
+  them.
+  Whatever the caller resolved into the context is as stale the second time
+  as the first: a condition that has to hold under the lock belongs in a state
+  property or a guard that reads the record, with its needs named in
+  `preloads`. `preloads/1` is the one list both the caller's fetch and the
+  commit's re-read load.
 
   The law: a run ends in `to` or leaves the record in `from`, never between.
   A bare effect must be idempotent, so a commit that fails after it is
   recovered by running again. An effect paired with an undo is reverted,
-  newest first, when anything after it fails.
+  newest first, when anything after it fails; an undo that fails raises once
+  the older ones have run. A bare effect that ran before a
+  failure cannot be reverted: `stranded` is told, with the context and the
+  reason, so the domain can alert or queue the retry. A raise is its own report
+  and does not reach it.
   """
 
   import Hoare.Result, only: [kleisli: 1, tap_error: 2]
@@ -25,20 +39,118 @@ defmodule Hoare.Transition do
   alias Hoare.Store
   alias Hoare.Transition
 
-  defstruct [:from, :to, guards: [], effects: []]
+  defstruct [:from, :to, :stranded, guards: [], effects: [], preloads: []]
 
   @type ctx :: %{:record => Store.subject(), :state => struct() | nil, optional(atom()) => term()}
   @type arrow :: (ctx() -> {:ok, ctx()} | {:error, term()})
   @type undo :: (ctx() -> :ok)
   @type effect :: arrow() | {arrow(), undo()}
+  @type stranded :: (ctx(), reason :: term() -> term())
+  @type commit_error :: :not_found | :status_changed
+  @type error(reason) :: {:error, reason | commit_error()}
   @type body :: (ctx() -> {:ok, term()} | {:error, term()})
   @type opts :: [store: module(), lock: term()]
   @type t :: %__MODULE__{
           from: [module(), ...],
           to: module(),
           guards: [arrow()],
-          effects: [effect()]
+          effects: [effect()],
+          stranded: stranded() | nil,
+          preloads: [term()]
         }
+
+  @doc "The guards, in order; none by default."
+  @callback guards() :: [arrow()]
+
+  @doc "The effects, in order; none by default."
+  @callback effects() :: [effect()]
+
+  @doc "Told when a run fails after a bare effect; wired only when defined."
+  @callback stranded(ctx(), reason :: term()) :: term()
+
+  @optional_callbacks stranded: 2
+
+  @doc """
+  Declares the transition as the module: the literal parts are options, the
+  arrows are callbacks, and the context struct is `record`, `state` and `:ctx`.
+
+      defmodule Pay do
+        use Hoare.Transition, from: [Issued], to: Paid, ctx: [:charge]
+
+        import Hoare.Result, only: [ensure: 2]
+
+        @impl Hoare.Transition
+        def guards, do: [ensure(&amount_due?/1, :nothing_due)]
+
+        @impl Hoare.Transition
+        def effects, do: [&cancel_reminder/1, {&charge/1, &refund/1}]
+
+        @impl Hoare.Transition
+        def stranded(ctx, reason), do: Alerts.reminder_cancelled_unpaid(ctx.record, reason)
+      end
+
+      Pay.run(%Pay{record: invoice}, &record_payment/1, store: Repo)
+
+  Injects `transition/0`, `check/1`, `run/3`, `preloads/0` and
+  `from_statuses/0`. `:preloads` are the transition's own, beyond its states'.
+  """
+  defmacro __using__(opts) do
+    quote do
+      @behaviour Hoare.Transition
+      @before_compile Hoare.Transition
+
+      @hoare_transition %Hoare.Transition{
+        from: unquote(Keyword.fetch!(opts, :from)),
+        to: unquote(Keyword.fetch!(opts, :to)),
+        preloads: unquote(Keyword.get(opts, :preloads, []))
+      }
+
+      defstruct [:record, :state | unquote(Keyword.get(opts, :ctx, []))]
+
+      @impl Hoare.Transition
+      def guards, do: []
+
+      @impl Hoare.Transition
+      def effects, do: []
+
+      defoverridable guards: 0, effects: 0
+
+      @spec check(Hoare.Transition.ctx()) :: {:ok, Hoare.Transition.ctx()} | {:error, term()}
+      def check(ctx), do: Hoare.Transition.check(transition(), ctx)
+
+      @spec run(Hoare.Transition.ctx(), Hoare.Transition.body(), Hoare.Transition.opts()) ::
+              {:ok, Hoare.Transition.ctx()} | {:error, term()}
+      def run(ctx, body, opts), do: Hoare.Transition.run(transition(), ctx, body, opts)
+
+      @spec preloads() :: [term()]
+      def preloads, do: Hoare.Transition.preloads(transition())
+
+      @spec from_statuses() :: [atom()]
+      def from_statuses, do: Hoare.Transition.from_statuses(transition())
+    end
+  end
+
+  defmacro __before_compile__(env) do
+    stranded =
+      if Module.defines?(env.module, {:stranded, 2}, :def),
+        do: quote(do: &__MODULE__.stranded/2)
+
+    quote do
+      @spec transition() :: Hoare.Transition.t()
+      def transition do
+        %{@hoare_transition | guards: guards(), effects: effects(), stranded: unquote(stranded)}
+      end
+    end
+  end
+
+  @doc "The statuses that tag the states the transition leaves."
+  @spec from_statuses(t()) :: [atom()]
+  def from_statuses(%Transition{from: from}), do: Enum.map(from, & &1.status())
+
+  @doc "Everything the states and guards read: the states' preloads, then the transition's own."
+  @spec preloads(t()) :: [term()]
+  def preloads(%Transition{from: from, to: to, preloads: own}),
+    do: Enum.flat_map(from ++ [to], &State.preloads/1) ++ own
 
   @doc "Matches `from` into the context's `state`, then runs the guards."
   @spec check(t(), ctx()) :: {:ok, ctx()} | {:error, term()}
@@ -58,70 +170,75 @@ defmodule Hoare.Transition do
   def run(%Transition{effects: effects} = transition, ctx, body, opts)
       when is_list(effects) and is_function(body, 1) do
     with {:ok, ctx} <- check(transition, ctx),
-         {:ok, ctx, done} <- perform(effects, ctx),
+         {:ok, ctx, done} <- perform(transition, ctx),
          {:ok, arrived} <-
            transition
            |> commit(ctx, body, converges?(done), opts)
-           |> tap_error(fn _ -> undo(done, ctx) end) do
+           |> tap_error(&fail(transition, done, ctx, &1)) do
       {:ok, %{ctx | record: arrived}}
     end
   end
 
   @doc """
-  Commits in one locked transaction: re-reads the record, confirms it is still
-  tagged by a `from` state, runs `body`, writes `to`'s status and asserts `to`.
+  Commits in one locked transaction: re-reads the record with the transition's
+  preloads, checks it again, runs `body` on the re-checked context, writes
+  `to`'s status and asserts `to` on a second read.
 
   A record already tagged by `to` is a concurrent run of the same transition:
   it commits nothing and is `{:ok, record}` when `converges?` (no effect left
-  anything behind), `{:error, :status_changed}` otherwise. A violated `to`
-  raises, rolling the transaction back. The re-read carries no preloads, so
-  only the tag is re-checked; the properties held on the context under the
-  guards. The status is written through the schema's `changeset/2`.
+  anything behind), `{:error, :status_changed}` otherwise. A record tagged by
+  neither is `{:error, :status_changed}`; one still tagged by `from` whose
+  properties or guards no longer hold returns their reason. A violated `to`
+  raises, rolling the transaction back. The status is written through the
+  schema's `changeset/2`.
   """
   @spec commit(t(), ctx(), body(), boolean(), opts()) ::
           {:ok, Store.subject()} | {:error, :not_found | :status_changed | term()}
   def commit(
-        %Transition{from: from, to: to},
-        %{record: %schema{id: id} = record} = ctx,
+        %Transition{to: to} = transition,
+        %{record: %schema{id: id}} = ctx,
         body,
         converges?,
         opts
       ) do
     store = Keyword.fetch!(opts, :store)
     lock = Keyword.get(opts, :lock, {schema, id})
+    preloads = preloads(transition)
 
     store.transact_with_lock(lock, fn ->
-      with {:ok, current} <- store.fetch(schema, id),
-           :from <- position(current, from, to),
+      with {:ok, current} <- store.read(schema, id, preloads),
+           {:from, current} <- position(current, transition),
+           {:ok, ctx} <- check(transition, %{ctx | record: current}),
            {:ok, _} <- body.(ctx),
-           {:ok, arrived} <- store.update(schema.changeset(record, %{status: to.status()})) do
+           {:ok, _} <- store.update(schema.changeset(current, %{status: to.status()})),
+           {:ok, arrived} <- store.read(schema, id, preloads) do
         arrived!(to, arrived)
       else
-        :to when converges? -> {:ok, %{record | status: to.status()}}
-        :to -> {:error, :status_changed}
+        {:to, arrived} when converges? -> {:ok, arrived}
+        {:to, _arrived} -> {:error, :status_changed}
         {:error, _} = error -> error
       end
     end)
   end
 
-  defp position(%{status: status}, from, to) do
+  defp position(%{status: status} = record, %Transition{to: to} = transition) do
     cond do
-      status == to.status() -> :to
-      status in Enum.map(from, & &1.status()) -> :from
+      status == to.status() -> {:to, record}
+      status in from_statuses(transition) -> {:from, record}
       true -> {:error, :status_changed}
     end
   end
 
   defp converges?(done), do: Enum.all?(done, &is_function(&1, 1))
 
-  defp perform(effects, ctx) do
+  defp perform(%Transition{effects: effects} = transition, ctx) do
     Enum.reduce_while(effects, {:ok, ctx, []}, fn effect, {:ok, ctx, done} ->
       case effect |> arrow() |> apply([ctx]) do
         {:ok, ctx} ->
           {:cont, {:ok, ctx, [effect | done]}}
 
-        {:error, _} = error ->
-          undo(done, ctx)
+        {:error, reason} = error ->
+          fail(transition, done, ctx, reason)
           {:halt, error}
       end
     end)
@@ -130,10 +247,28 @@ defmodule Hoare.Transition do
   defp arrow({run, _undo}), do: run
   defp arrow(run) when is_function(run, 1), do: run
 
-  defp undo(done, ctx), do: Enum.each(done, &revert(&1, ctx))
+  # Undoes what can be undone, then reports what cannot: bare effects that ran.
+  defp fail(%Transition{stranded: stranded}, done, ctx, reason) do
+    undo(done, ctx)
+    if stranded && Enum.any?(done, &is_function(&1, 1)), do: stranded.(ctx, reason)
+  end
 
-  defp revert({_run, undo}, ctx), do: :ok = undo.(ctx)
-  defp revert(_idempotent, _ctx), do: :ok
+  # Every undo gets its turn; the first that failed is raised once all have run.
+  defp undo(done, ctx) do
+    done
+    |> Enum.flat_map(&revert(&1, ctx))
+    |> Enum.take(1)
+    |> Enum.each(fn {kind, failure, stacktrace} -> :erlang.raise(kind, failure, stacktrace) end)
+  end
+
+  defp revert({_run, undo}, ctx) do
+    :ok = undo.(ctx)
+    []
+  catch
+    kind, failure -> [{kind, failure, __STACKTRACE__}]
+  end
+
+  defp revert(_idempotent, _ctx), do: []
 
   defp arrived!(to, record) do
     case State.match(to, record) do
