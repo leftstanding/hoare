@@ -62,4 +62,46 @@ defmodule Hoare.StateTest do
       assert State.match_any([Bare, Refined], %{status: :OTHER}) == {:error, :not_bare}
     end
   end
+
+  defmodule Declared do
+    import Hoare.State, only: [defstate: 2, defstate: 3]
+
+    defstate Open, status: :OPEN
+    defstate Closed, status: :CLOSED, missing: :still_open, preloads: [:closer]
+
+    defstate Signed, status: :SIGNED_OFF, witnesses: [:signer] do
+      @impl Hoare.State
+      def properties, do: [&signer/1]
+
+      defp signer(%__MODULE__{record: %{signer: nil}}), do: {:error, :unsigned}
+
+      defp signer(%__MODULE__{record: %{signer: signer}} = state),
+        do: {:ok, %{state | signer: signer}}
+    end
+  end
+
+  describe "use Hoare.State" do
+    alias Declared.Closed
+    alias Declared.Open
+    alias Declared.Signed
+
+    test "declares a status-only state, its missing reason derived from the status" do
+      assert State.match(Open, %{status: :OPEN}) == {:ok, %Open{record: %{status: :OPEN}}}
+      assert State.match(Open, %{status: :CLOSED}) == {:error, :not_open}
+      assert State.preloads(Open) == []
+    end
+
+    test "takes the missing reason and the preloads it is given" do
+      assert State.match(Closed, %{status: :OPEN}) == {:error, :still_open}
+      assert State.preloads(Closed) == [:closer]
+    end
+
+    test "fills declared witnesses through overridden properties" do
+      record = %{status: :SIGNED_OFF, signer: "ada"}
+
+      assert State.match(Signed, record) == {:ok, %Signed{record: record, signer: "ada"}}
+      assert State.match(Signed, %{record | signer: nil}) == {:error, :unsigned}
+      assert State.match(Signed, %{status: :OPEN}) == {:error, :not_signed_off}
+    end
+  end
 end

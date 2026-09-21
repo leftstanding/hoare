@@ -4,7 +4,8 @@ defmodule Hoare.Result do
 
   The tagged tuple is the ecosystem's result type, so nothing is wrapped: `with`
   is the bind, and these name the few compositions a transition needs so it
-  can be a value. `kleisli/1` composes a list of arrows into one.
+  can be a value. `kleisli/1` composes a list of arrows into one; `ensure/2`
+  lifts a predicate into an arrow, for guards and properties that only test.
   """
 
   @type ok(value) :: {:ok, value}
@@ -19,6 +20,11 @@ defmodule Hoare.Result do
   @doc "Composes arrows left to right into one arrow; the empty list is the identity."
   @spec kleisli([arrow(term(), term())]) :: arrow(term(), term())
   def kleisli(arrows), do: fn value -> Enum.reduce(arrows, {:ok, value}, &bind(&2, &1)) end
+
+  @doc "An arrow that passes its value through when `pred` holds and is `{:error, reason}` otherwise."
+  @spec ensure((a -> as_boolean(term())), term()) :: arrow(a, a) when a: term()
+  def ensure(pred, reason),
+    do: fn value -> if pred.(value), do: {:ok, value}, else: {:error, reason} end
 
   @spec tap_ok(t(a), (a -> term())) :: t(a) when a: term()
   def tap_ok({:ok, value} = ok, fun) do

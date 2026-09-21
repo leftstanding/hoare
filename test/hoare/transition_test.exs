@@ -12,29 +12,31 @@ defmodule Hoare.TransitionTest do
     def changeset(record, attrs), do: {record, attrs}
   end
 
-  # The store the commit runs against: `stored/1` is what the locked re-read
-  # returns; `update/1` applies the changes in memory.
+  # `Hoare.Store.Memory`, reporting what the commit asked of it.
   defmodule FakeStore do
     @behaviour Hoare.Store
 
-    def stored(record), do: Process.put(:stored, record)
+    alias Hoare.Store.Memory
+
+    defdelegate stored(record), to: Memory, as: :put
 
     @impl Hoare.Store
     def transact_with_lock(lock, fun) do
       send(self(), {:locked, lock})
-      fun.()
+      Memory.transact_with_lock(lock, fun)
     end
 
     @impl Hoare.Store
-    def fetch(Record, id) do
-      case Process.get(:stored) do
-        %Record{id: ^id} = record -> {:ok, record}
-        _ -> {:error, :not_found}
-      end
+    def read(schema, id, preloads) do
+      send(self(), {:read, preloads})
+      Memory.read(schema, id, preloads)
     end
 
     @impl Hoare.Store
-    def update({record, attrs}), do: {:ok, struct!(record, attrs)}
+    def update({record, _attrs} = changeset) do
+      send(self(), {:updated, record})
+      Memory.update(changeset)
+    end
   end
 
   defmodule A do
@@ -43,6 +45,7 @@ defmodule Hoare.TransitionTest do
     def status, do: :A
     def missing, do: :not_a
     def properties, do: []
+    def preloads, do: [:from_a]
   end
 
   defmodule B do
@@ -56,11 +59,28 @@ defmodule Hoare.TransitionTest do
     defp witness(%B{record: %{witness: witness}} = state), do: {:ok, %{state | witness: witness}}
   end
 
+  defmodule Bare do
+    use Hoare.Transition, from: [A], to: B
+  end
+
+  defmodule Declared do
+    use Hoare.Transition, from: [A], to: B, ctx: [:guarded, :performed], preloads: [:own]
+
+    @impl Hoare.Transition
+    def guards, do: [&{:ok, %{&1 | guarded: true}}]
+
+    @impl Hoare.Transition
+    def effects, do: [&{:ok, %{&1 | performed: true}}]
+
+    @impl Hoare.Transition
+    def stranded(ctx, reason), do: send(self(), {:stranded, ctx, reason})
+  end
+
   @a_to_b %Transition{from: [A], to: B}
   @opts [store: FakeStore]
 
   setup do
-    FakeStore.stored(%Record{id: 1, status: :A})
+    FakeStore.stored(%Record{id: 1, status: :A, witness: "seen"})
     :ok
   end
 
@@ -96,21 +116,36 @@ defmodule Hoare.TransitionTest do
     end
   end
 
+  describe "preloads/1" do
+    test "concatenates the from states', the to state's and the transition's own" do
+      assert Transition.preloads(%{@a_to_b | preloads: [own: :nested]}) ==
+               [:from_a, own: :nested]
+    end
+
+    test "is empty when nothing declares any" do
+      assert Transition.preloads(%Transition{from: [B], to: B}) == []
+    end
+  end
+
   describe "run/4" do
     test "runs guards, effects and body in order and returns the context on the committed record" do
       transition = %{
         @a_to_b
-        | guards: [&{:ok, Map.put(&1, :trail, [:guard])}],
-          effects: [&{:ok, Map.update!(&1, :trail, fn t -> [:effect | t] end)}]
+        | guards: [&{:ok, Map.put(&1, :guarded, true)}],
+          effects: [&{:ok, Map.put(&1, :performed, &1.guarded)}]
       }
 
       body = fn ctx ->
-        assert ctx.trail == [:effect, :guard]
+        assert %{guarded: true, performed: true} = ctx
         {:ok, ctx}
       end
 
       assert {:ok,
-              %{record: %Record{id: 1, status: :B, witness: "seen"}, trail: [:effect, :guard]}} =
+              %{
+                record: %Record{id: 1, status: :B, witness: "seen"},
+                guarded: true,
+                performed: true
+              }} =
                run(transition, ctx(:A), body)
     end
 
@@ -133,8 +168,10 @@ defmodule Hoare.TransitionTest do
     end
 
     test "raises inside the transaction when the committed record is not in the to state" do
+      FakeStore.stored(%Record{id: 1, status: :A, witness: nil})
+
       assert_raise RuntimeError, ~r/not .*TransitionTest.B: :no_witness/, fn ->
-        run(@a_to_b, ctx(:A, nil))
+        run(@a_to_b, ctx(:A))
       end
     end
 
@@ -165,9 +202,50 @@ defmodule Hoare.TransitionTest do
     end
 
     test "refuses a record that disappeared under it" do
-      FakeStore.stored(nil)
+      Hoare.Store.Memory.delete(Record, 1)
 
       assert run(@a_to_b, ctx(:A), fn _ -> flunk("body ran") end) == {:error, :not_found}
+    end
+
+    test "checks the fresh record again under the lock, guards included" do
+      FakeStore.stored(%Record{id: 1, status: :A, witness: "changed"})
+
+      transition = %{
+        @a_to_b
+        | guards: [
+            fn
+              %{record: %Record{witness: "seen"}} = ctx -> {:ok, ctx}
+              _ctx -> {:error, :witness_changed}
+            end
+          ]
+      }
+
+      assert run(transition, ctx(:A), fn _ -> flunk("body ran") end) ==
+               {:error, :witness_changed}
+    end
+
+    test "runs the body and the status write on the fresh record" do
+      fresh = FakeStore.stored(%Record{id: 1, status: :A, witness: "fresh"})
+
+      body = fn ctx ->
+        assert ctx.record == fresh
+        assert ctx.state == %A{record: fresh}
+        {:ok, ctx}
+      end
+
+      assert {:ok, %{record: %Record{status: :B, witness: "fresh"}}} = run(@a_to_b, ctx(:A), body)
+      assert_received {:updated, ^fresh}
+    end
+
+    test "asserts the to state on what the body left in the store" do
+      body = fn _ctx -> {:ok, FakeStore.stored(%Record{id: 1, status: :A, witness: nil})} end
+
+      assert_raise RuntimeError, ~r/:no_witness/, fn -> run(@a_to_b, ctx(:A), body) end
+    end
+
+    test "reads with the transition's preloads" do
+      assert {:ok, _} = run(%{@a_to_b | preloads: [:own]}, ctx(:A))
+      assert_received {:read, [:from_a, :own]}
     end
 
     test "converges on a record already in the to state when every effect was idempotent" do
@@ -236,6 +314,115 @@ defmodule Hoare.TransitionTest do
       assert_raise MatchError, fn ->
         run(transition, ctx(:A), fn _ -> {:error, :commit_failed} end)
       end
+    end
+  end
+
+  describe "run/4 with a failing undo" do
+    test "still undoes the older effects, then raises the failure" do
+      transition = %{
+        @a_to_b
+        | effects: [
+            {&{:ok, &1}, fn _ -> tap(:ok, fn _ -> send(self(), :undo_older) end) end},
+            {&{:ok, &1}, fn _ -> raise "carrier down" end}
+          ]
+      }
+
+      assert_raise RuntimeError, "carrier down", fn ->
+        run(transition, ctx(:A), fn _ -> {:error, :commit_failed} end)
+      end
+
+      assert_received :undo_older
+    end
+  end
+
+  describe "run/4 with a stranded hook" do
+    defp stranded(ctx, reason), do: send(self(), {:stranded, ctx, reason})
+
+    test "reports a commit that fails after a bare effect" do
+      transition = %{
+        @a_to_b
+        | effects: [&{:ok, Map.put(&1, :voided, true)}],
+          stranded: &stranded/2
+      }
+
+      assert run(transition, ctx(:A), fn _ -> {:error, :commit_failed} end) ==
+               {:error, :commit_failed}
+
+      assert_received {:stranded, %{voided: true}, :commit_failed}
+    end
+
+    test "reports a later effect that fails after a bare effect" do
+      transition = %{
+        @a_to_b
+        | effects: [&{:ok, &1}, fn _ -> {:error, :effect_failed} end],
+          stranded: &stranded/2
+      }
+
+      assert run(transition, ctx(:A)) == {:error, :effect_failed}
+      assert_received {:stranded, _ctx, :effect_failed}
+    end
+
+    test "stays quiet when every completed effect was undone" do
+      transition = %{
+        @a_to_b
+        | effects: [{&{:ok, &1}, fn _ -> :ok end}],
+          stranded: &stranded/2
+      }
+
+      assert run(transition, ctx(:A), fn _ -> {:error, :commit_failed} end) ==
+               {:error, :commit_failed}
+
+      refute_received {:stranded, _, _}
+    end
+
+    test "stays quiet when a guard refuses or a concurrent run converges" do
+      refused = %{
+        @a_to_b
+        | guards: [fn _ -> {:error, :blocked} end],
+          effects: [&{:ok, &1}],
+          stranded: &stranded/2
+      }
+
+      assert run(refused, ctx(:A)) == {:error, :blocked}
+
+      FakeStore.stored(%Record{id: 1, status: :B, witness: "seen"})
+      assert {:ok, _} = run(%{refused | guards: []}, ctx(:A))
+
+      refute_received {:stranded, _, _}
+    end
+  end
+
+  describe "use Hoare.Transition" do
+    test "defaults to no guards, no effects and no stranded hook" do
+      assert Bare.transition() == @a_to_b
+      assert %Bare{} == %Bare{record: nil, state: nil}
+    end
+
+    test "assembles the declaration from the options and the callbacks" do
+      assert %Transition{from: [A], to: B, guards: [_], effects: [_], preloads: [:own]} =
+               Declared.transition()
+
+      assert Declared.preloads() == [:from_a, :own]
+      assert Declared.from_statuses() == [:A]
+    end
+
+    test "checks and runs on its own context struct" do
+      record = %Record{id: 1, status: :A, witness: "seen"}
+
+      assert {:ok, %Declared{guarded: true, performed: nil}} =
+               Declared.check(%Declared{record: record})
+
+      assert {:ok, %Declared{record: %Record{status: :B}, guarded: true, performed: true}} =
+               Declared.run(%Declared{record: record}, &{:ok, &1}, @opts)
+    end
+
+    test "wires stranded/2 when the module defines it" do
+      record = %Record{id: 1, status: :A, witness: "seen"}
+
+      assert Declared.run(%Declared{record: record}, fn _ -> {:error, :commit_failed} end, @opts) ==
+               {:error, :commit_failed}
+
+      assert_received {:stranded, %Declared{performed: true}, :commit_failed}
     end
   end
 end

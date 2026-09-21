@@ -52,4 +52,21 @@ defmodule Hoare.ResultTest do
       assert map_error({:ok, 1}, fn _ -> flunk("ran") end) == {:ok, 1}
     end
   end
+
+  describe "ensure/2" do
+    test "passes the value through when the predicate holds" do
+      assert ensure(&(&1 > 0), :not_positive).(1) == {:ok, 1}
+    end
+
+    test "is the reason when it does not" do
+      assert ensure(&(&1 > 0), :not_positive).(0) == {:error, :not_positive}
+    end
+
+    test "composes with the other arrows" do
+      arrow = kleisli([ensure(&is_integer/1, :not_integer), &{:ok, &1 + 1}])
+
+      assert arrow.(1) == {:ok, 2}
+      assert arrow.(:a) == {:error, :not_integer}
+    end
+  end
 end
