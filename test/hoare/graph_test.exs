@@ -37,6 +37,16 @@ defmodule Hoare.GraphTest do
     assert Graph.states(@transitions) == [Draft, Issued, Paid, Void]
   end
 
+  test "leaving/2 is every transition out of the state" do
+    assert Graph.leaving(@transitions, Draft) == [Issue, Cancel]
+    assert Graph.leaving(@transitions, Paid) == []
+  end
+
+  test "entering/2 names a fan-in transition once" do
+    assert Graph.entering(@transitions, Void) == [Cancel]
+    assert Graph.entering(@transitions, Draft) == []
+  end
+
   test "to_mermaid/1 draws the state diagram" do
     assert Graph.to_mermaid(@transitions) == """
            stateDiagram-v2
