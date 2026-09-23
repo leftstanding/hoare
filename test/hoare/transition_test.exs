@@ -59,6 +59,19 @@ defmodule Hoare.TransitionTest do
     defp witness(%B{record: %{witness: witness}} = state), do: {:ok, %{state | witness: witness}}
   end
 
+  # Untagged: the state is the witness the body writes, with no status to move.
+  defmodule Witnessed do
+    use State, witnesses: [:witness]
+
+    @impl State
+    def properties, do: [&witness/1]
+
+    defp witness(%Witnessed{record: %{witness: nil}}), do: {:error, :no_witness}
+
+    defp witness(%Witnessed{record: %{witness: witness}} = state),
+      do: {:ok, %{state | witness: witness}}
+  end
+
   defmodule Bare do
     use Hoare.Transition, from: [A], to: B
   end
@@ -266,6 +279,58 @@ defmodule Hoare.TransitionTest do
 
       assert run(transition, ctx(:A), fn _ -> flunk("body ran") end) == {:error, :status_changed}
       assert_received :undone
+    end
+  end
+
+  describe "commit/5 with untagged states" do
+    @to_witnessed %Transition{from: [A], to: Witnessed}
+    @from_witnessed %Transition{from: [Witnessed], to: B}
+
+    test "moves into an untagged to state on the body's writes alone" do
+      FakeStore.stored(%Record{id: 1, status: :A, witness: nil})
+      body = fn ctx -> {:ok, FakeStore.stored(%{ctx.record | witness: "written"})} end
+
+      assert {:ok, %{record: %Record{status: :A, witness: "written"}}} =
+               run(@to_witnessed, ctx(:A, nil), body)
+
+      refute_received {:updated, _}
+    end
+
+    test "raises when the body's writes do not reach the untagged to state" do
+      FakeStore.stored(%Record{id: 1, status: :A, witness: nil})
+
+      assert_raise RuntimeError, ~r/:no_witness/, fn ->
+        run(@to_witnessed, ctx(:A, nil), &{:ok, &1})
+      end
+    end
+
+    test "converges on a record already in the untagged to state" do
+      FakeStore.stored(%Record{id: 1, status: :A, witness: "already"})
+      transition = %{@to_witnessed | effects: [&{:ok, &1}]}
+
+      assert {:ok, %{record: %Record{witness: "already"}}} =
+               run(transition, ctx(:A, nil), fn _ -> flunk("body ran") end)
+    end
+
+    test "positions an untagged from state by a full match" do
+      FakeStore.stored(%Record{id: 1, status: :C, witness: "seen"})
+
+      assert {:ok, %{record: %Record{status: :B, witness: "seen"}}} =
+               run(@from_witnessed, ctx(:A))
+    end
+
+    test "refuses a record whose properties no longer put it in the untagged from state" do
+      FakeStore.stored(%Record{id: 1, status: :C, witness: nil})
+
+      assert run(@from_witnessed, ctx(:A), fn _ -> flunk("body ran") end) ==
+               {:error, :status_changed}
+    end
+  end
+
+  describe "from_statuses/1" do
+    test "names the tagged states' values and skips the untagged ones" do
+      assert Transition.from_statuses(%Transition{from: [A, Witnessed], to: B}) == [:A]
+      assert Transition.from_statuses(%Transition{from: [Witnessed], to: B}) == []
     end
   end
 
