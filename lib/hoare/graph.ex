@@ -5,7 +5,9 @@ defmodule Hoare.Graph do
 
   The list is explicit, kept wherever the record's transitions are known.
   Assert on `edges/1` so a change to the graph is a deliberate diff, or paste
-  `to_mermaid/1` into the docs.
+  `to_mermaid/1` into the docs. `leaving/2` and `entering/2` ask a single
+  state for its edges, so a test can name a sink (`leaving/2` is empty) or an
+  unreachable state (`entering/2` is empty).
   """
 
   @type edge :: {from :: module(), via :: module(), to :: module()}
@@ -25,6 +27,18 @@ defmodule Hoare.Graph do
     |> edges()
     |> Enum.flat_map(fn {from, _via, to} -> [from, to] end)
     |> Enum.uniq()
+  end
+
+  @doc "The transitions that leave `state`."
+  @spec leaving([module()], module()) :: [module()]
+  def leaving(transitions, state) do
+    for({^state, via, _to} <- edges(transitions), do: via) |> Enum.uniq()
+  end
+
+  @doc "The transitions that reach `state`."
+  @spec entering([module()], module()) :: [module()]
+  def entering(transitions, state) do
+    for({_from, via, ^state} <- edges(transitions), do: via) |> Enum.uniq()
   end
 
   @doc "A Mermaid `stateDiagram-v2`, modules labelled by their last segment."

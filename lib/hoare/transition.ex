@@ -143,9 +143,16 @@ defmodule Hoare.Transition do
     end
   end
 
-  @doc "The statuses that tag the states the transition leaves."
+  @doc "The tag values of the states the transition leaves; untagged states contribute none."
   @spec from_statuses(t()) :: [atom()]
-  def from_statuses(%Transition{from: from}), do: Enum.map(from, & &1.status())
+  def from_statuses(%Transition{from: from}) do
+    Enum.flat_map(from, fn state ->
+      case State.tag(state) do
+        {_field, value} -> [value]
+        nil -> []
+      end
+    end)
+  end
 
   @doc "Everything the states and guards read: the states' preloads, then the transition's own."
   @spec preloads(t()) :: [term()]
@@ -182,15 +189,16 @@ defmodule Hoare.Transition do
   @doc """
   Commits in one locked transaction: re-reads the record with the transition's
   preloads, checks it again, runs `body` on the re-checked context, writes
-  `to`'s status and asserts `to` on a second read.
+  `to`'s tag and asserts `to` on a second read.
 
-  A record already tagged by `to` is a concurrent run of the same transition:
-  it commits nothing and is `{:ok, record}` when `converges?` (no effect left
-  anything behind), `{:error, :status_changed}` otherwise. A record tagged by
-  neither is `{:error, :status_changed}`; one still tagged by `from` whose
-  properties or guards no longer hold returns their reason. A violated `to`
-  raises, rolling the transaction back. The status is written through the
-  schema's `changeset/2`.
+  A record already in `to` is a concurrent run of the same transition: it
+  commits nothing and is `{:ok, record}` when `converges?` (no effect left
+  anything behind), `{:error, :status_changed}` otherwise. A record in neither
+  is `{:error, :status_changed}`; one still in `from` whose properties or
+  guards no longer hold returns their reason. A violated `to` raises, rolling
+  the transaction back. The tag is written through the schema's
+  `changeset/2`; an untagged `to` has none, so the body's own writes are the
+  move and `to` is asserted on the re-read all the same.
   """
   @spec commit(t(), ctx(), body(), boolean(), opts()) ::
           {:ok, Store.subject()} | {:error, :not_found | :status_changed | term()}
@@ -210,7 +218,7 @@ defmodule Hoare.Transition do
            {:from, current} <- position(current, transition),
            {:ok, ctx} <- check(transition, %{ctx | record: current}),
            {:ok, _} <- body.(ctx),
-           {:ok, _} <- store.update(schema.changeset(current, %{status: to.status()})),
+           {:ok, _} <- write_tag(store, schema, current, to),
            {:ok, arrived} <- store.read(schema, id, preloads) do
         arrived!(to, arrived)
       else
@@ -221,11 +229,27 @@ defmodule Hoare.Transition do
     end)
   end
 
-  defp position(%{status: status} = record, %Transition{to: to} = transition) do
+  defp position(record, %Transition{from: from, to: to}) do
     cond do
-      status == to.status() -> {:to, record}
-      status in from_statuses(transition) -> {:from, record}
+      in_state?(to, record) -> {:to, record}
+      Enum.any?(from, &in_state?(&1, record)) -> {:from, record}
       true -> {:error, :status_changed}
+    end
+  end
+
+  # A tagged state is positioned by its tag alone; an untagged one by a full match.
+  defp in_state?(state, record) do
+    case State.tag(state) do
+      {field, value} -> Map.get(record, field) == value
+      nil -> match?({:ok, _}, State.match(state, record))
+    end
+  end
+
+  # An untagged `to` has no tag to write: the body's own writes are the move.
+  defp write_tag(store, schema, current, to) do
+    case State.tag(to) do
+      {field, value} -> store.update(schema.changeset(current, %{field => value}))
+      nil -> {:ok, current}
     end
   end
 
