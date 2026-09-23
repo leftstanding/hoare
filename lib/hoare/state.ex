@@ -168,14 +168,14 @@ defmodule Hoare.State do
   @doc "The state's declared preloads; none when it declares none."
   @spec preloads(module()) :: [term()]
   def preloads(state) do
-    Code.ensure_loaded!(state)
+    Code.ensure_compiled!(state)
     if function_exported?(state, :preloads, 0), do: state.preloads(), else: []
   end
 
   @doc "The state's tag, `{field, value}`; `nil` when the state is its properties alone."
   @spec tag(module()) :: tag()
   def tag(state) do
-    Code.ensure_loaded!(state)
+    Code.ensure_compiled!(state)
     if function_exported?(state, :status, 0), do: {field(state), state.status()}
   end
 
