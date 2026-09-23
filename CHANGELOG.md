@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.3.0 (2026-09-23)
+
+### Added
+
+- Untagged states: a state that declares no `status:` *is* its properties, and
+  they alone decide whether the record is in it. `match/2` runs them without a
+  tag check; `match_any/2` decides by tag where one matches and otherwise
+  tries the untagged states in declared order; the commit positions an
+  untagged state by a full match and writes no tag, so the body's own writes
+  are the move, with `to` asserted on the re-read all the same.
+- `field:` on a state: the tag is read from the named column rather than
+  `:status`.
+- `Hoare.State.tag/1`, `{field, value}` or `nil`.
+- `Hoare.State.classify/2`: the one state of a list the record is in, else
+  `:unclassified` or `{:ambiguous, states}`. Exhaustive and exclusive, made
+  executable; run it over the rows before moving a writer onto a transition.
+- A module declaring states with `defstate/3` gains `all/0`, in declared
+  order, and `classify/1` over them.
+- `Hoare.Graph.leaving/2` and `entering/2`.
+
+### Changed
+
+- `status/0`, `field/0` and `missing/0` are optional `Hoare.State` callbacks;
+  an untagged state defines none of them.
+- `Hoare.Transition.from_statuses/1` returns the tag values of the tagged
+  `from` states and skips the untagged ones.
+
 ## 0.2.0 (2026-09-21)
 
 ### Breaking

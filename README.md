@@ -29,7 +29,7 @@ plain `{:ok, value} | {:error, reason}` tuples throughout.
 ```elixir
 def deps do
   [
-    {:hoare, "~> 0.2"}
+    {:hoare, "~> 0.3"}
   ]
 end
 ```
@@ -69,6 +69,33 @@ Hoare.State.match(Invoice.State.Issued, invoice)
 implements the `Hoare.State` behaviour and defines the struct itself. The
 state one transition reaches is the module another leaves, so the graph is
 nominal and inspectable.
+
+A tag is read from `:status` unless `field:` names another column, and a state
+that declares no `status:` is untagged: it is its properties.
+
+```elixir
+defstate Reserved, witnesses: [:reservation], preloads: [:reservation] do
+  @impl Hoare.State
+  def properties, do: [&reserved/1]
+
+  defp reserved(%__MODULE__{record: %{reservation: nil}}), do: {:error, :not_reserved}
+  defp reserved(%__MODULE__{record: %{reservation: r}} = state), do: {:ok, %{state | reservation: r}}
+end
+```
+
+Records with no status column live here: nothing tags them, so the properties
+are the state. A transition into an untagged `to` writes no tag; the body's
+own writes are the move, and `to` is asserted on the re-read as always.
+
+The module holding the states gains `all/0` and `classify/1`:
+
+```elixir
+Unit.State.classify(unit)
+#=> {:ok, %Reserved{...}} | {:error, :unclassified} | {:error, {:ambiguous, [Reserved, Picked]}}
+```
+
+Exactly one match is "the states are exhaustive and exclusive" made
+executable. Run it over the rows before moving a writer onto a transition.
 
 ## Transitions
 
@@ -132,8 +159,8 @@ whether to offer the action. `Pay.from_statuses/0` serves queries.
 In one transaction, under the store's lock on `{schema, id}` (or
 `opts[:lock]`), the commit reads the record again with the declared preloads,
 runs the whole check on it, runs the body on the re-checked context, writes
-`to`'s status through the schema's `changeset/2`, and asserts `to` on a second
-read. So:
+`to`'s tag through the schema's `changeset/2` (nothing, when `to` is
+untagged), and asserts `to` on a second read. So:
 
 - **Guards run twice**, before the effects and again under the lock. A guard
   is a function of the context alone and writes only keys no effect writes.
@@ -184,8 +211,9 @@ defmodule MyApp.Repo do
 end
 ```
 
-Nothing in Hoare depends on Ecto: the record is any struct with `id` and
-`status`, whose module has a `changeset/2` the store's `update/1` accepts.
+Nothing in Hoare depends on Ecto: the record is any struct with `id` and the
+fields its states read, whose module has a `changeset/2` the store's
+`update/1` accepts.
 
 ## Testing
 
@@ -207,6 +235,9 @@ Guards and properties are plain functions of data: `Pay.check/1` and
 ```elixir
 Hoare.Graph.edges([Invoice.Issue, Invoice.Pay, Invoice.Cancel])
 #=> [{Draft, Issue, Issued}, {Issued, Pay, Paid}, {Draft, Cancel, Void}, {Issued, Cancel, Void}]
+
+Hoare.Graph.leaving([Invoice.Issue, Invoice.Pay, Invoice.Cancel], Invoice.State.Draft)
+#=> [Invoice.Issue, Invoice.Cancel]
 
 Hoare.Graph.to_mermaid([Invoice.Issue, Invoice.Pay, Invoice.Cancel])
 ```
