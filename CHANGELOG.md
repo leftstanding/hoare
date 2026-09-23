@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.1 (2026-09-23)
+
+### Fixed
+
+- `Hoare.State.tag/1` and `preloads/1` wait for a state module the compiler
+  has not reached yet (`Code.ensure_compiled!/1`), so a module attribute may
+  ask a transition for its `from_statuses/0`.
+
 ## 0.3.0 (2026-09-23)
 
 ### Added
