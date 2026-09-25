@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.4.0 (2026-09-25)
+
+### Breaking
+
+- `Hoare.Store` gains `read_by/3`, a preloaded read by natural key. An
+  `Ecto.Repo` satisfies it with `get_by/2`; `Hoare.Store.Memory` scans what
+  the process holds.
+
+### Added
+
+- `Hoare.Intake`: a transition whose subject changes, committed by natural
+  key. `from` is a state of the payload, an untagged state over the incoming
+  map, so validation becomes the precondition rather than a step before it
+  and the way in appears on the graph. `key` and `identity` name witnesses of
+  the payload state: the key locks and reads, identity tells a replay from a
+  collision. Nothing under the key runs the body and asserts `to` on what it
+  created; a row matching identity converges as `{:ok, record}`, or
+  `{:error, :already_exists}` when an effect must be undone; a row that does
+  not match is `{:error, :conflict}`.
+- `Hoare.Transition.discharge/3`: the guards, the effects and a given commit,
+  with the undo and `stranded` cascade around them. `run/4` is it with
+  `commit/5`; `Hoare.Intake` passes its own.
+
 ## 0.3.1 (2026-09-23)
 
 ### Fixed

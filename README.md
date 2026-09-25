@@ -21,7 +21,7 @@ perform  effects                        IO; bare = idempotent, {run, undo} = rev
 commit   lock ▸ read ▸ check ▸ body ▸ write to ▸ read ▸ assert to      one transaction
 ```
 
-No processes, no DSL beyond two `use` macros, no dependencies. Results are
+No processes, no DSL beyond three `use` macros, no dependencies. Results are
 plain `{:ok, value} | {:error, reason}` tuples throughout.
 
 ## Installation
@@ -29,7 +29,7 @@ plain `{:ok, value} | {:error, reason}` tuples throughout.
 ```elixir
 def deps do
   [
-    {:hoare, "~> 0.3"}
+    {:hoare, "~> 0.4"}
   ]
 end
 ```
@@ -185,11 +185,63 @@ directly, a resume path that skips an announcement, say:
 Hoare.Transition.run(%{Pay.transition() | effects: [&charge_again/1]}, ctx, body, store: Repo)
 ```
 
+## Intake
+
+A record has to arrive before it can move. `Hoare.Intake` is a transition
+whose subject changes: `from` is a state of the payload, an untagged state
+over the incoming map, and `to` the state of a record that does not exist
+yet.
+
+```elixir
+defmodule ValidInvoice do
+  use Hoare.State, witnesses: [:number, :account_id, :external_id]
+
+  @impl Hoare.State
+  def properties, do: [&numbered/1, &accounted/1]
+end
+
+defmodule Receive do
+  use Hoare.Intake,
+    from: [ValidInvoice],
+    to: Issued,
+    schema: MyApp.Invoice,
+    key: [:number, :account_id],
+    identity: [:external_id]
+end
+
+Receive.run(%Receive{record: params}, &insert_invoice/1, store: Repo)
+```
+
+Validation stops being a step before the transition and becomes its
+precondition, in the same vocabulary as every other state, and the way in
+appears on the graph rather than as an arrow from nowhere.
+
+`key` and `identity` name witnesses of the payload state, which are read as
+fields of the record too: the key is the natural key the datastore enforces,
+and identity is what tells the same payload arriving twice from two things
+colliding on one key. The commit locks on `{schema, key}` and reads by it,
+so:
+
+- nothing there: the body creates the record, and `to` is asserted on what it
+  created;
+- a row matching `identity`: the same payload again, converging as
+  `{:ok, record}` when every completed effect was bare, and
+  `{:error, :already_exists}`, with the undos run, otherwise;
+- a row that does not match: `{:error, :conflict}`.
+
+The found row is returned as it stands, and `to` is asserted only on the row
+the body creates. A record has a life after it arrives, and the transitions
+that moved it are what answer for where it is now; re-asserting `to` here
+would refuse a replay for having been fulfilled. What intake promises is
+narrower and exact: a record exists under this key, it is this same thing,
+and it was in `to` when it was created. That last clause holds only while
+every writer of the record is declared.
+
 ## Store
 
-`Hoare.Store` is the three operations the commit needs:
-`transact_with_lock/2`, `read/3` and `update/1`. An `Ecto.Repo` has the last
-already:
+`Hoare.Store` is the four operations the commit needs:
+`transact_with_lock/2`, `read/3`, `read_by/3` and `update/1`. An `Ecto.Repo`
+has the last already:
 
 ```elixir
 defmodule MyApp.Repo do
@@ -207,6 +259,11 @@ defmodule MyApp.Repo do
   @impl Hoare.Store
   def read(schema, id, preloads) do
     if record = get(schema, id), do: {:ok, preload(record, preloads)}, else: {:error, :not_found}
+  end
+
+  @impl Hoare.Store
+  def read_by(schema, key, preloads) do
+    if record = get_by(schema, key), do: {:ok, preload(record, preloads)}, else: {:error, :not_found}
   end
 end
 ```
