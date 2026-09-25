@@ -33,6 +33,9 @@ defmodule Hoare.TransitionTest do
     end
 
     @impl Hoare.Store
+    defdelegate read_by(schema, key, preloads), to: Memory
+
+    @impl Hoare.Store
     def update({record, _attrs} = changeset) do
       send(self(), {:updated, record})
       Memory.update(changeset)

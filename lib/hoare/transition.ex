@@ -23,6 +23,9 @@ defmodule Hoare.Transition do
   `preloads`. `preloads/1` is the one list both the caller's fetch and the
   commit's re-read load.
 
+  A transition whose subject is created rather than moved is `Hoare.Intake`,
+  which shares all of this but the commit.
+
   The law: a run ends in `to` or leaves the record in `from`, never between.
   A bare effect must be idempotent, so a commit that fails after it is
   recovered by running again. An effect paired with an undo is reverted,
@@ -174,14 +177,25 @@ defmodule Hoare.Transition do
   needs `:store`, a `Hoare.Store`; `:lock` defaults to `{schema, id}`.
   """
   @spec run(t(), ctx(), body(), opts()) :: {:ok, ctx()} | {:error, term()}
-  def run(%Transition{effects: effects} = transition, ctx, body, opts)
-      when is_list(effects) and is_function(body, 1) do
+  def run(%Transition{} = transition, ctx, body, opts) when is_function(body, 1),
+    do: discharge(transition, ctx, &commit(transition, &1, body, &2, opts))
+
+  @doc """
+  Discharges the triple with the given commit: the guards, then the effects,
+  then `commit`, undoing what ran when it fails.
+
+  `commit` takes the checked context and whether every completed effect was
+  bare, and answers with the record the run ends on. `run/4` hands it
+  `commit/5`; `Hoare.Intake` hands it one keyed differently.
+  """
+  @spec discharge(t(), ctx(), (ctx(), boolean() -> {:ok, Store.subject()} | {:error, term()})) ::
+          {:ok, ctx()} | {:error, term()}
+  def discharge(%Transition{effects: effects} = transition, ctx, commit)
+      when is_list(effects) and is_function(commit, 2) do
     with {:ok, ctx} <- check(transition, ctx),
          {:ok, ctx, done} <- perform(transition, ctx),
          {:ok, arrived} <-
-           transition
-           |> commit(ctx, body, converges?(done), opts)
-           |> tap_error(&fail(transition, done, ctx, &1)) do
+           ctx |> commit.(converges?(done)) |> tap_error(&fail(transition, done, ctx, &1)) do
       {:ok, %{ctx | record: arrived}}
     end
   end
