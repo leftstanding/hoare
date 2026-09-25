@@ -30,6 +30,27 @@ defmodule Hoare.Store.MemoryTest do
     end
   end
 
+  describe "read_by/3" do
+    test "returns the record whose fields match every one of the key's" do
+      Memory.put(%Record{id: 1, status: :A, note: "other"})
+      record = Memory.put(%Record{id: 2, status: :B, note: "wanted"})
+
+      assert Memory.read_by(Record, [status: :B, note: "wanted"], [:anything]) == {:ok, record}
+    end
+
+    test "is :not_found when no record matches the whole key" do
+      Memory.put(%Record{id: 1, status: :A, note: "wanted"})
+
+      assert Memory.read_by(Record, [status: :B, note: "wanted"], []) == {:error, :not_found}
+    end
+
+    test "does not answer with another schema's record" do
+      Memory.put(%Record{id: 1, status: :A})
+
+      assert Memory.read_by(Hoare.Store.MemoryTest, [status: :A], []) == {:error, :not_found}
+    end
+  end
+
   describe "update/1" do
     setup do
       %{record: Memory.put(%Record{id: 1, status: :A, note: "kept"})}

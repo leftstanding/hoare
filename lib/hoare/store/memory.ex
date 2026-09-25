@@ -10,7 +10,8 @@ defmodule Hoare.Store.Memory do
 
   Records live in the process dictionary, so async tests do not share them.
   The lock is not taken and preloads are ignored: seed a record as loaded as
-  the states need it. `update/1` takes what the schema's `changeset/2`
+  the states need it. `read_by/3` scans them, taking the first whose fields
+  match, since nothing here enforces that a natural key is unique. `update/1` takes what the schema's `changeset/2`
   returned: anything shaped like an `Ecto.Changeset` (`data`, `changes`,
   `valid?`) or a `{record, attrs}` pair.
   """
@@ -46,10 +47,26 @@ defmodule Hoare.Store.Memory do
   end
 
   @impl Store
+  def read_by(schema, key, _preloads) do
+    Process.get()
+    |> Enum.find_value(fn
+      {{__MODULE__, ^schema, _id}, record} -> keyed?(record, key) && record
+      _other -> nil
+    end)
+    |> case do
+      nil -> {:error, :not_found}
+      record -> {:ok, record}
+    end
+  end
+
+  @impl Store
   def update(%{valid?: false} = changeset), do: {:error, changeset}
   def update(%{data: record, changes: changes}), do: write(record, changes)
   def update({record, attrs}), do: write(record, attrs)
 
   # Only the changes are written, as a changeset does: what the body stored stays.
   defp write(%schema{id: id}, changes), do: {:ok, put(struct!(get(schema, id), changes))}
+
+  defp keyed?(record, key),
+    do: Enum.all?(key, fn {field, value} -> Map.get(record, field) == value end)
 end
